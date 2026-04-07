@@ -1,0 +1,218 @@
+name: KitchenFlow-v1
+version: "1.0.0"
+description: >
+  A real-world cloud kitchen dispatch environment where an AI agent decides
+  *when* to summon a delivery driver. The goal is to synchronise food readiness
+  with driver arrival — minimising cold food, driver idle time, and order
+  cancellations. Simulates urban traffic dynamics, kitchen throughput variance,
+  and food temperature decay.
+
+authors:
+  - name: KitchenFlow Team
+    url: https://huggingface.co/spaces/your-username/kitchenflow-v1
+
+tags:
+  - logistics
+  - real-world
+  - delivery
+  - scheduling
+  - multi-objective-reward
+
+license: MIT
+
+# ---------------------------------------------------------------------------
+# Observation Space
+# ---------------------------------------------------------------------------
+observation_space:
+  type: dict
+  fields:
+    food_prep_progress:
+      type: float
+      low: 0.0
+      high: 1.0
+      description: Fraction of food preparation complete (0 = raw, 1 = bagged & ready)
+
+    driver_dist:
+      type: float
+      low: 0.0
+      high: 20.0
+      unit: km
+      description: Current distance of nearest summoned (or available) driver from kitchen
+
+    traffic_index:
+      type: float
+      low: 1.0
+      high: 2.5
+      description: >
+        Real-time road congestion multiplier. 1.0 = free flow, 2.5 = gridlock.
+        Follows a mean-reverting random walk inspired by Uber Movement data.
+
+    food_temp:
+      type: float
+      low: 0.0
+      high: 100.0
+      unit: celsius
+      description: >
+        Current food temperature. Starts at 75°C (perfect serving temp).
+        Only decreases once food is ready and waiting for pickup.
+
+# ---------------------------------------------------------------------------
+# Action Space
+# ---------------------------------------------------------------------------
+action_space:
+  type: discrete
+  n: 2
+  meanings:
+    - wait          # 0: do nothing this step (1-minute tick)
+    - summon_driver # 1: one-time trigger to call the nearest driver
+
+# ---------------------------------------------------------------------------
+# Reward Function
+# ---------------------------------------------------------------------------
+reward:
+  type: multi_objective
+  components:
+    sync_bonus:
+      value: +10.0
+      condition: >
+        Driver arrives AND food is ready, with ≤1 minute wait on either side.
+        Rewards precise timing.
+
+    temp_penalty:
+      value: -1.0
+      unit: per_degree_celsius
+      condition: >
+        Applied at delivery time for each °C the food is below 75°C.
+        Food cools at 1.0–2.0°C per minute depending on task difficulty.
+
+    driver_cancel_penalty:
+      value: -20.0
+      condition: >
+        Driver arrived but waited more than 15 minutes for food. Driver cancels
+        the order — a catastrophic outcome.
+
+    timeout_penalty:
+      value: -15.0
+      condition: >
+        Episode reaches 60 minutes without a delivery.
+
+    shaping_signal:
+      value: -0.05
+      unit: per_degree_per_step
+      condition: >
+        Small per-step penalty proportional to food temp drop while waiting.
+        Provides a differentiable progress signal during training.
+
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
+tasks:
+
+  - id: easy_dispatch
+    name: "Easy: Calm Traffic Dispatch"
+    difficulty: easy
+    description: >
+      Low-variance traffic (σ=0.10), tight prep window (σ=1 min), driver
+      always within 3 km. The 80% threshold baseline is competitive.
+      A trained agent should score > 0.65.
+    config_overrides:
+      prep_time_std: 1.0
+      driver_dist_std: 0.5
+      traffic_std: 0.10
+      traffic_drift: 0.02
+      temp_decay_rate: 1.0
+    seeds: 42
+    n_seeds: 100
+    scoring_seeds: 20
+    baseline_score: 0.55
+    ceiling_score: 1.0
+    grader: tasks.Task1.grader
+
+  - id: medium_dispatch
+    name: "Medium: Variable Traffic Dispatch"
+    difficulty: medium
+    description: >
+      Standard traffic variance (σ=0.30), prep jitter ±3 min, driver up to
+      5 km away. The 80% rule starts losing to traffic variability.
+      A trained agent should score > 0.50.
+    config_overrides:
+      prep_time_std: 3.0
+      driver_dist_std: 1.5
+      traffic_std: 0.30
+      traffic_drift: 0.05
+      temp_decay_rate: 1.5
+    seeds: 200
+    n_seeds: 100
+    scoring_seeds: 20
+    baseline_score: 0.35
+    ceiling_score: 1.0
+    grader: tasks.Task2.grader
+
+  - id: hard_dispatch
+    name: "Hard: Rush Hour with Traffic Spikes"
+    difficulty: hard
+    description: >
+      Rush-hour conditions (mean=1.8×, σ=0.50), random traffic spikes (5%/step),
+      prep jitter ±5 min, driver up to 7+ km away, food cools at 2°C/min.
+      Requires predictive timing. A strong agent scores > 0.45.
+    config_overrides:
+      prep_time_std: 5.0
+      driver_dist_std: 2.5
+      traffic_mean: 1.8
+      traffic_std: 0.50
+      traffic_drift: 0.12
+      temp_decay_rate: 2.0
+      traffic_spike_prob: 0.05
+      traffic_spike_mag: 0.40
+    seeds: 500
+    n_seeds: 100
+    scoring_seeds: 25
+    baseline_score: 0.18
+    ceiling_score: 1.0
+    grader: tasks.Task3.grader
+
+# ---------------------------------------------------------------------------
+# API
+# ---------------------------------------------------------------------------
+api:
+  reset:
+    signature: "reset(seed: Optional[int] = None) -> Observation"
+    description: Reset the episode and return the initial observation dict.
+
+  step:
+    signature: "step(action: int) -> Tuple[Observation, float, bool, dict]"
+    description: >
+      Advance time by 1 minute. Returns (observation, reward, done, info).
+      info keys: termination, food_temp, driver_wait_min, food_wait_min,
+      sync_bonus, driver_summoned_at, driver_arrived_at, food_ready_at.
+
+  state:
+    signature: "state() -> dict"
+    description: >
+      Full internal state including hidden variables (prep_time, wait counters,
+      boolean flags). Use for logging, debugging, and graders.
+
+# ---------------------------------------------------------------------------
+# Deployment
+# ---------------------------------------------------------------------------
+deployment:
+  huggingface_space: "your-username/kitchenflow-v1"
+  docker_image: "your-username/kitchenflow:latest"
+  http_api: true
+  endpoints:
+    - POST /reset
+    - POST /step
+    - GET  /state
+    - GET  /observation_space
+    - GET  /action_space
+    - GET  /tasks
+    - POST /grade
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+reproducibility:
+  python_version: "3.11"
+  seed_control: per_episode
+  deterministic: true
+  baseline_script: baseline.py
